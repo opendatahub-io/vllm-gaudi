@@ -109,7 +109,7 @@ einops==0.8.0
     # via -r requirements-test.in
 email-validator==2.2.0
     # via pydantic
-evaluate==0.4.3
+evaluate==0.4.6
     # via lm-eval
 fastparquet==2024.11.0
     # via genai-perf
