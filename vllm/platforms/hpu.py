@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import os
 from typing import TYPE_CHECKING, Optional
@@ -7,6 +8,7 @@ import torch
 
 from vllm import envs
 from vllm.logger import init_logger
+from vllm.utils import DEFAULT_MAX_NUM_BATCHED_TOKENS, is_fake_hpu
 
 from .interface import Platform, PlatformEnum, _Backend
 
@@ -26,9 +28,20 @@ class HpuPlatform(Platform):
     dispatch_key: str = "HPU"
     ray_device_key: str = "HPU"
     device_control_env_var: str = "HABANA_VISIBLE_MODULES"
+    simple_compile_backend: str = "hpu_backend" if not is_fake_hpu(
+    ) else "inductor"
     supported_quantization: list[str] = [
-        "compressed-tensors", "fp8", "inc", "awq_hpu", "gptq_hpu"
+        "compressed-tensors", "fp8", "inc", "awq_hpu", "gptq_hpu",
+        "bitsandbytes"
     ]
+
+    @property
+    def supported_dtypes(self) -> list[torch.dtype]:
+        """Returns the supported dtypes for the current platform."""
+        # Be careful with the order of the dtypes. The first dtype will
+        # be used as the default dtype fallback for the current platform,
+        # when encountering unsupported dtypes in "auto" dtype.
+        return [torch.bfloat16, torch.float32]
 
     @classmethod
     def get_attn_backend_cls(cls, selected_backend: _Backend, head_size: int,
@@ -99,6 +112,16 @@ class HpuPlatform(Platform):
                     "To override that behavior, please set "
                     "VLLM_WORKER_MULTIPROC_METHOD=fork explicitly.")
                 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+
+        if vllm_config.model_config and vllm_config.model_config.use_mla:
+            logger.info(
+                "MLA is enabled on a non-GPU platform; forcing chunked "
+                "prefill and prefix caching to be disabled.")
+            vllm_config.scheduler_config.enable_chunked_prefill = False
+            vllm_config.scheduler_config.chunked_prefill_enabled = False
+            vllm_config.scheduler_config.max_num_batched_tokens = max(
+                vllm_config.scheduler_config.max_model_len,
+                DEFAULT_MAX_NUM_BATCHED_TOKENS)
 
     @classmethod
     def is_pin_memory_available(cls):

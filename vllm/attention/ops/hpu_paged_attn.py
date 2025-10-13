@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 ###############################################################################
 # Copyright (C) 2024 Habana Labs, Ltd. an Intel Company
@@ -21,6 +22,7 @@ class HPUPagedAttentionMetadata:
     block_mapping: Optional[torch.Tensor]
     block_usage: Optional[torch.Tensor]
     block_groups: Optional[torch.Tensor]
+    alibi_blocks: Optional[torch.Tensor]
 
 
 class HPUPagedAttention:

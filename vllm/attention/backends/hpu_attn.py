@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 ###############################################################################
 # Copyright (C) 2024-2025 Habana Labs, Ltd. an Intel Company
@@ -11,7 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple, Type
 import torch
 import vllm_hpu_extension.kernels as kernels
 import vllm_hpu_extension.ops as ops
-from vllm_hpu_extension.flags import enabled_flags
+from vllm_hpu_extension.runtime import get_config
 from vllm_hpu_extension.utils import (FP8Matmul, Matmul, ModuleFusedSDPA,
                                       Softmax, VLLMFP8KVCache, VLLMKVCache)
 
@@ -102,16 +103,16 @@ class HPUMLAAttentionBackend(AttentionBackend):
     def swap_blocks(
         src_kv_cache: torch.Tensor,
         dst_kv_cache: torch.Tensor,
-        src_to_dst: torch.Tensor,
+        src_to_dsts: torch.Tensor,
     ) -> None:
-        HPUPagedAttention.swap_blocks(src_kv_cache, dst_kv_cache, src_to_dst)
+        HPUPagedAttention.swap_blocks(src_kv_cache, dst_kv_cache, src_to_dsts)
 
     @staticmethod
     def copy_blocks(
         kv_caches: List[torch.Tensor],
-        src_to_dists: torch.Tensor,
+        src_to_dsts: torch.Tensor,
     ) -> None:
-        HPUPagedAttention.copy_blocks(kv_caches, src_to_dists)
+        HPUPagedAttention.copy_blocks(kv_caches, src_to_dsts)
 
 
 @dataclass
@@ -135,6 +136,13 @@ class HPUAttentionMetadata(HPUPagedAttentionMetadata, AttentionMetadata):
     cross_block_groups: Optional[torch.Tensor] = None
     cross_block_usage: Optional[torch.Tensor] = None
     cross_attn_bias: Optional[torch.Tensor] = None
+    window_block_list: Optional[torch.Tensor] = None
+    window_slot_mapping: Optional[torch.Tensor] = None
+    window_block_mapping: Optional[torch.Tensor] = None
+    window_block_groups: Optional[torch.Tensor] = None
+    window_block_usage: Optional[torch.Tensor] = None
+    window_attn_bias: Optional[torch.Tensor] = None
+    use_window_sdpa: Optional[bool] = None
 
 
 @dataclass
@@ -156,13 +164,14 @@ class HPUMLAImpl(MLACommonImpl[HPUAttentionMetadata], torch.nn.Module):
             blocksparse_params: Optional[Dict[str, Any]],
             logits_soft_cap: Optional[float],
             attn_type: str,
+            kv_sharing_target_layer_name: Optional[str] = None,
             # MLA Specific Arguments
             **kwargs) -> None:
         torch.nn.Module.__init__(self)
         MLACommonImpl.__init__(self, num_heads, head_size, scale, num_kv_heads,
                                alibi_slopes, sliding_window, kv_cache_dtype,
                                blocksparse_params, logits_soft_cap, attn_type,
-                               **kwargs)
+                               kv_sharing_target_layer_name, **kwargs)
         self.enable_fp8_attn = kv_cache_dtype == 'fp8_inc' and os.environ.get(
             'QUANT_CONFIG', None) is None
         self.matmul_qk = Matmul() if not self.enable_fp8_attn \
@@ -178,12 +187,9 @@ class HPUMLAImpl(MLACommonImpl[HPUAttentionMetadata], torch.nn.Module):
             else VLLMFP8KVCache()
         self.fused_scaled_dot_product_attention = kernels.fsdpa()
 
-        if "fsdpa" in enabled_flags():
-            assert alibi_slopes is None, \
-                'Prefill with FusedSDPA not supported with alibi slopes!'
-            self.prefill_impl = 'fsdpa'
-        else:
-            self.prefill_impl = 'naive'
+        self.prefill_impl = get_config().prompt_attn_impl
+        assert self.prefill_impl != 'fsdpa_impl' or alibi_slopes is None, \
+            'Prefill with FusedSDPA not supported with alibi slopes!'
 
         unsupported_features = [
             alibi_slopes, sliding_window, blocksparse_params, logits_soft_cap
@@ -217,13 +223,8 @@ class HPUMLAImpl(MLACommonImpl[HPUAttentionMetadata], torch.nn.Module):
         batch_size = q.shape[0]
         is_prefill = attn_metadata.is_prompt
 
-        # Restore head dim (for rotary embedding)
         k_pe = k_pe.view(-1, 1, self.qk_rope_head_dim)
         q = q.view(-1, self.num_heads, self.qk_head_dim)
-        assert hasattr(attn_metadata,
-                       "input_positions"), f"attn meta: {attn_metadata}"
-
-        input_positions = attn_metadata.input_positions.view(-1)
         if not is_prefill:
             # decode
             q_nope, q_pe = q.split(
@@ -234,19 +235,13 @@ class HPUMLAImpl(MLACommonImpl[HPUAttentionMetadata], torch.nn.Module):
             decode_ql_nope = torch.bmm(q_nope, self.W_UK_T)
             # Convert from (N, B, L) to (B, N, L)
             decode_ql_nope = decode_ql_nope.transpose(0, 1)
-            q_pe, k_pe = \
-                self.rotary_emb(input_positions, q_pe, k_pe)
-        else:
-            # prefill
-            q_pe = q[..., self.qk_nope_head_dim:]
-            q[..., self.qk_nope_head_dim:], k_pe = \
-                self.rotary_emb(input_positions, q_pe, k_pe)
 
         slot_mapping = attn_metadata.slot_mapping.flatten(
         ) if attn_metadata.slot_mapping is not None else None
 
         latent_vec_k = torch.concat(
-            (k_c_normed, k_pe.view(batch_size, -1, self.qk_rope_head_dim)),
+            (k_c_normed,
+             k_pe.view(*k_c_normed.shape[:-1], self.qk_rope_head_dim)),
             dim=-1)
         latent_vec_k = latent_vec_k.view(
             -1, self.qk_rope_head_dim + self.kv_lora_rank)
@@ -255,15 +250,13 @@ class HPUMLAImpl(MLACommonImpl[HPUAttentionMetadata], torch.nn.Module):
         if kv_cache is not None and len(kv_cache) == 2:
             self.latent_cache_k(latent_vec_k, kv_cache[0], slot_mapping)
             k_cache = kv_cache[0]
-            v_cache = None
 
         if is_prefill:
             return self._forward_prefill(q, k_c_normed, k_pe, attn_metadata,
                                          batch_size)
         else:
-            return self._forward_decode(decode_ql_nope, q_pe,
-                                        (k_cache, v_cache), attn_metadata,
-                                        batch_size)
+            return self._forward_decode(decode_ql_nope, q_pe, k_cache,
+                                        attn_metadata, batch_size)
 
     def _forward_prefill(  # type: ignore
             self, q: torch.Tensor, k_c_normed: torch.Tensor,
@@ -312,11 +305,11 @@ class HPUMLAImpl(MLACommonImpl[HPUAttentionMetadata], torch.nn.Module):
 
     def _forward_decode(  # type: ignore
             self, q_nope: torch.Tensor, q_pe: torch.Tensor,
-            kv_cache: torch.Tensor, attn_metadata: HPUAttentionMetadata,
+            k_cache: torch.Tensor, attn_metadata: HPUAttentionMetadata,
             batch_size: int) -> torch.Tensor:
         query = torch.cat([q_nope, q_pe], dim=-1)
-        key_cache = kv_cache[0].unsqueeze(1)
-        value_cache = kv_cache[1]  # value_cache is None
+        key_cache = k_cache.unsqueeze(1)
+        value_cache = None
         output = HPUPagedAttention.forward_decode(
             query=query,
             key_cache=key_cache,
@@ -334,7 +327,6 @@ class HPUMLAImpl(MLACommonImpl[HPUAttentionMetadata], torch.nn.Module):
             keys_fetch_func=self.latent_cache_k.fetch_from_cache,
             values_fetch_func=None,
             kv_lora_rank=self.kv_lora_rank)
-        output = output.view(batch_size, 1, -1)
         result = self._v_up_proj(output)
         result = result.view(batch_size, 1, -1)
         return result
@@ -367,11 +359,14 @@ class HPUAttentionImpl(AttentionImpl, torch.nn.Module):
         sliding_window: Optional[int],
         kv_cache_dtype: str,
         blocksparse_params: Optional[Dict[str, Any]] = None,
-        max_seq_len: int = 4096,
+        logits_soft_cap: Optional[float] = None,
         attn_type: str = AttentionType.DECODER,
+        kv_sharing_target_layer_name: Optional[str] = None,
         use_irope: bool = False,
     ) -> None:
         super(AttentionImpl, self).__init__()
+        if kv_sharing_target_layer_name is not None:
+            raise NotImplementedError("KV sharing is not supported in V0.")
         if use_irope:
             logger.warning_once(
                 "Using irope in HPU is not supported yet, it will fall back "
@@ -398,28 +393,30 @@ class HPUAttentionImpl(AttentionImpl, torch.nn.Module):
         HPUFusedSDPA = kernels.fsdpa()
         self.fused_scaled_dot_product_attention = None if HPUFusedSDPA is None \
             else ModuleFusedSDPA(HPUFusedSDPA)
-
-        self.prefill_impl = 'naive'
-        if "flex_attention" in enabled_flags():
-            self.prefill_impl = 'flex'
-        if "fsdpa" in enabled_flags():
-            assert alibi_slopes is None, \
+        self.prefill_impl = get_config().prompt_attn_impl
+        self.use_contiguous_pa = get_config().use_contiguous_pa
+        if alibi_slopes is not None:
+            assert self.prefill_impl != 'flex_impl', \
+                'Prefill with Flex Attention not supported with alibi slopes!'
+            assert self.prefill_impl != 'fsdpa_impl', \
                 'Prefill with FusedSDPA not supported with alibi slopes!'
-            self.prefill_impl = 'fsdpa'
+            assert self.use_contiguous_pa, \
+                'Non-contiguous PA not supported with alibi slopes!'
 
         self.num_kv_heads = num_heads if num_kv_heads is None else num_kv_heads
         self.sliding_window = sliding_window
-        self.alibi_slopes = alibi_slopes
+        self.prompt_position_bias = None
+        self.prev_attn = None
+        self.alibi_slopes = None
         if alibi_slopes is not None:
+            slope_tensor_dtype = torch.float32 if \
+                get_config().fp32_alibi_biases else torch.bfloat16
             alibi_slopes_tensor = torch.tensor(alibi_slopes,
-                                               dtype=torch.bfloat16)
+                                               dtype=slope_tensor_dtype)
             self.alibi_slopes = alibi_slopes_tensor
+
         assert self.num_heads % self.num_kv_heads == 0
         self.num_queries_per_kv = self.num_heads // self.num_kv_heads
-
-        if self.prefill_impl == 'fsdpa':
-            assert alibi_slopes is None, \
-                'Prefill with FusedSDPA not supported with alibi slopes!'
 
         supported_head_sizes = HPUPagedAttention.get_supported_head_sizes()
         if head_size not in supported_head_sizes:
@@ -434,6 +431,32 @@ class HPUAttentionImpl(AttentionImpl, torch.nn.Module):
             raise NotImplementedError("Encoder self-attention "
                                       "is not implemented for "
                                       "HPUAttentionImpl")
+
+        # TODO: Currently, there is limitation of SLIDE_RIGHT value
+        # with accuracy issue. Will remove this once it's fixed.
+        if self.sliding_window is not None:
+            self.sliding_window_right = int(
+                os.environ.get('VLLM_FUSEDSDPA_SLIDE_RIGHT', '0'))
+
+    def _maybe_init_alibi_biases(
+        self,
+        max_seq_len,
+        prev_attn: Optional[torch.nn.Module] = None,
+    ) -> None:
+        self.max_seq_len = max_seq_len
+        self.prev_attn = None if prev_attn is None else prev_attn.impl
+        if self.alibi_slopes is not None:
+            if self.prev_attn is not None:
+                self.alibi_slopes = self.prev_attn.alibi_slopes
+                self.prompt_position_bias = self.prev_attn.prompt_position_bias
+            else:
+                # Creating the prompt_position_bias once and reusing it
+                # if seq_len permits.
+                self.prompt_position_bias = _make_prompt_alibi_bias(
+                    alibi_slopes=self.alibi_slopes,
+                    seq_len=self.max_seq_len,
+                    dtype=self.alibi_slopes.dtype,
+                )
 
     def forward(
         self,
@@ -494,16 +517,63 @@ class HPUAttentionImpl(AttentionImpl, torch.nn.Module):
                         self.head_size)
 
             attn_bias = attn_metadata.attn_bias
-            if attn_bias is not None and self.alibi_slopes is not None:
-                position_bias = _make_alibi_bias(self.alibi_slopes,
-                                                 self.num_kv_heads,
-                                                 attn_bias.dtype,
-                                                 attn_bias.shape[-1])
-                attn_bias = attn_bias.tile((1, self.num_kv_heads, 1, 1))
-                attn_bias.add_(position_bias)
+            position_bias = None
+            # If we have alibi_slopes, incorporate them with
+            if (attn_metadata.block_list is None
+                    and self.prompt_position_bias is not None
+                    and self.alibi_slopes is not None):
+                assert attn_bias is not None, \
+                        'attn_bias must be set before calling ' \
+                        'model.forward with alibi biases'
+                slice_1_size = attn_bias.size(-2)
+                slice_2_size = attn_bias.size(-1)
+                if self.max_seq_len >= max(slice_1_size, slice_2_size):
+                    # Using pre-computed prompt_position_bias subset.
+                    position_bias = self.prompt_position_bias[:, :,
+                                                              -slice_1_size:,
+                                                              -slice_2_size:]
+
+                else:
+                    # For longer sequences than precomputed,
+                    # recreate the bias. This is memory inefficient.
+                    position_bias = _make_prompt_alibi_bias(
+                        alibi_slopes=self.alibi_slopes,
+                        seq_len=max(slice_1_size, slice_2_size),
+                        dtype=self.alibi_slopes.dtype,
+                    )
 
             block_list = attn_metadata.block_list if attn_metadata \
                 and attn_metadata.block_list is not None else None
+
+            common_args = self.common_attention_args(block_list, key_cache,
+                                                     value_cache,
+                                                     attn_metadata.block_size)
+
+            if self.sliding_window:
+                if attn_metadata.window_attn_bias is not None:
+                    attn_bias = attn_metadata.window_attn_bias
+
+                if attn_metadata.use_window_sdpa:
+                    # TODO: Currently when sliding_window FusedSDPA is used,
+                    # the order of graphs for kvcache index copy and sdpa are
+                    # mixed up, causing the perf issue. Split the graph here.
+                    import habana_frameworks.torch as htorch
+                    htorch.core.mark_step()
+
+                    attn_bias = attn_metadata.attn_bias
+                    window_size = (self.sliding_window, 0 if attn_bias is None
+                                   else self.sliding_window_right)
+                    common_args['window_size'] = window_size
+                    # TODO: Currently HPU doesn't support GQA for FusedSDPA
+                    # with causal + window, so repeat KV so QKV are all the
+                    # same shape.
+                    if query_shape != kv_shape and attn_bias is None:
+                        repeat_kv = self.num_heads // self.num_kv_heads
+                        key = key.repeat_interleave(repeat_kv, dim=1)
+                        value = value.repeat_interleave(repeat_kv, dim=1)
+                        kv_shape = query_shape
+                else:
+                    window_size = (-1, -1)
 
             out = ops.prompt_attention(
                 impl=self.prefill_impl,
@@ -512,20 +582,46 @@ class HPUAttentionImpl(AttentionImpl, torch.nn.Module):
                 value=value.view(kv_shape),
                 is_causal=True,
                 attn_bias=attn_bias,
+                position_bias=position_bias,
                 valid_seq_lengths=attn_metadata.seq_lens_tensor,
-                **self.common_attention_args(block_list, key_cache,
-                                             value_cache,
-                                             attn_metadata.block_size))
+                **common_args)
+
             output = out.reshape(batch_size, seq_len, hidden_size)
         else:
             # Decoding run.
+            if self.sliding_window and \
+               attn_metadata.window_block_list is not None:
+                block_list = attn_metadata.window_block_list
+                block_groups = attn_metadata.window_block_groups
+                block_mapping = attn_metadata.window_block_mapping
+                attn_bias = attn_metadata.window_attn_bias
+            else:
+                block_list = attn_metadata.block_list
+                block_groups = attn_metadata.block_groups
+                block_mapping = attn_metadata.block_mapping
+                attn_bias = attn_metadata.attn_bias
+
+            self.position_bias = None
+            alibi_blocks = getattr(attn_metadata, 'alibi_blocks', None)
+            if self.alibi_slopes is not None and alibi_blocks is not None:
+                if self.prev_attn is not None:
+                    self.position_bias = self.prev_attn.position_bias
+                else:
+                    # For decoding, compute position bias using alibi_blocks.
+                    self.position_bias = _make_decode_alibi_bias(
+                        alibi_blocks=alibi_blocks,
+                        alibi_slopes=self.alibi_slopes,
+                        dtype=self.alibi_slopes.dtype,
+                    )
+
             output = HPUPagedAttention.forward_decode(
                 query=query,
-                block_mapping=attn_metadata.block_mapping,
-                block_bias=attn_metadata.attn_bias,
-                block_groups=attn_metadata.block_groups,
-                **self.common_attention_args(attn_metadata.block_list,
-                                             key_cache, value_cache,
+                block_mapping=block_mapping,
+                block_bias=attn_bias,
+                block_groups=block_groups,
+                position_bias=self.position_bias,
+                **self.common_attention_args(block_list, key_cache,
+                                             value_cache,
                                              attn_metadata.block_size))
         # Reshape the output tensor.
         return output.view(batch_size, seq_len, hidden_size)
@@ -631,6 +727,7 @@ class HPUAttentionImpl(AttentionImpl, torch.nn.Module):
                 block_mapping=block_mapping,
                 block_bias=attn_bias,
                 block_groups=block_groups,
+                position_bias=None,
                 **self.common_attention_args(block_list, key_cache,
                                              value_cache,
                                              attn_metadata.block_size))
@@ -638,33 +735,80 @@ class HPUAttentionImpl(AttentionImpl, torch.nn.Module):
         return output.view(batch_size, -1, hidden_size)
 
 
-def _make_alibi_bias(
+def _make_prompt_alibi_bias(
     alibi_slopes: torch.Tensor,
-    num_kv_heads: int,
-    dtype: torch.dtype,
     seq_len: int,
+    dtype: torch.dtype,
 ) -> torch.Tensor:
-    bias = torch.arange(seq_len, dtype=dtype)
-    # NOTE(zhuohan): HF uses
-    #     `bias = bias[None, :].repeat(seq_len, 1)`
-    # here. We find that both biases give the same results, but
-    # the bias below more accurately follows the original ALiBi
-    # paper.
-    # Calculate a matrix where each element represents ith element- jth
-    # element.
-    bias = bias[None, :] - bias[:, None]
+    """
+    Create the ALiBi position bias tensor for prompt stage.
+    This tensor is reused or tiled as needed for each forward pass.
+    Does not scale with batch size or number of blocks.
 
-    padded_len = (seq_len + 7) // 8 * 8
+    Args:
+        alibi_slopes: shape = [num_heads]
+        seq_len: int
+        dtype: torch.dtype
+
+    Returns:
+        A per-head bias tensor of shape [1, num_heads, seq_len, seq_len].
+        This bias encodes positional information via ALiBi slopes.
+    """
+    # Create the bias matrix for positional differences
+    bias = torch.arange(seq_len, dtype=dtype, device=alibi_slopes.device)
+    bias = bias[None, :] - bias[:, None]  # Shape: [seq_len, seq_len]
+
+    #padded_len = (seq_len + 7) // 8 * 8
     num_heads = alibi_slopes.shape[0]
-    bias = torch.empty(
-        1,  # batch size
+    per_head_bias = torch.empty(
+        1,
         num_heads,
         seq_len,
-        padded_len,
+        seq_len,  # Directly use seq_len instead of padded_len
         device=alibi_slopes.device,
         dtype=dtype,
-    )[:, :, :, :seq_len].copy_(bias)
-    bias.mul_(alibi_slopes[:, None, None])
-    if num_heads != num_kv_heads:
-        bias = bias.unflatten(1, (num_kv_heads, num_heads // num_kv_heads))
-    return bias
+    )
+
+    # Copy the bias matrix into each head
+    per_head_bias[:, :] = bias
+
+    # Scale the bias by the ALiBi slopes
+    per_head_bias.mul_(alibi_slopes[:, None, None])
+
+    return per_head_bias
+
+
+def _make_decode_alibi_bias(
+    alibi_blocks: torch.Tensor,
+    alibi_slopes: torch.Tensor,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """
+    Create the ALiBi position bias tensor for decode stage.
+    Uses stored alibi_blocks and slopes for final scaling.
+    Scales with number of blocks, not with batch size.
+
+    Args:
+        alibi_blocks: shape = [num_blocks, block_size]
+        alibi_slopes: shape = [num_heads]
+        dtype: torch.dtype
+
+    Returns:
+        A per-head bias tensor of shape [num_blocks, num_heads, block_size].
+        Each row encodes position-dependent ALiBi slopes for decoding steps.
+    """
+    num_heads = alibi_slopes.shape[0]
+    per_head_bias = torch.empty(
+        alibi_blocks.size(0),
+        num_heads,
+        alibi_blocks.size(-1),
+        device=alibi_slopes.device,
+        dtype=dtype,
+    )
+    # NOTE(Tanner):
+    # .copy_ was not performing broadcasting of bias
+    # to all 32 heads in Eager mode.
+    per_head_bias[:, :] = alibi_blocks.unsqueeze(-2)
+    per_head_bias.mul_(alibi_slopes[None, :, None])
+
+    return per_head_bias
