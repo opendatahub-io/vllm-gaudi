@@ -10,14 +10,14 @@ accelerate==1.0.1
     # via
     #   lm-eval
     #   peft
-aiohappyeyeballs==2.4.3
+aiohappyeyeballs==2.6.1
     # via aiohttp
-aiohttp==3.10.10
+aiohttp==3.13.3
     # via
     #   datasets
     #   fsspec
     #   lm-eval
-aiosignal==1.3.1
+aiosignal==1.4.0
     # via
     #   aiohttp
     #   ray
@@ -353,7 +353,9 @@ pooch==1.8.2
 portalocker==2.10.1
     # via sacrebleu
 propcache==0.2.0
-    # via yarl
+    # via
+    #   aiohttp
+    #   yarl
 protobuf==5.28.3
     # via
     #   ray
@@ -567,6 +569,7 @@ typepy[datetime]==1.3.2
     #   tabledata
 typing-extensions==4.12.2
     # via
+    #   aiosignal
     #   anyio
     #   black
     #   huggingface-hub
