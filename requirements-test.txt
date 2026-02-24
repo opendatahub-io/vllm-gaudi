@@ -246,7 +246,7 @@ mypy-extensions==1.0.0
     # via black
 networkx==3.2.1
     # via torch
-nltk==3.9.1
+nltk==3.9.3
     # via rouge-score
 numba==0.60.0
     # via librosa
