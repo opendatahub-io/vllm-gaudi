@@ -41,7 +41,7 @@ create_measure_config() {
 
     model_name_lower=$(echo "$2" | tr '[:upper:]' '[:lower:]')
 
-    tmp_config="{\"method\": \"HOOKS\",\"mode\": \"MEASURE\",\"observer\": \"maxabs\",\"allowlist\": {\"types\": [], \"names\":  []},\"blocklist\": {\"types\": [], \"names\":  [\"lm_head\"]},\"quantize_weight\": false,\"dump_stats_path\": \"$1/$2/$3/inc_output\"}"
+    tmp_config="{\"method\": \"HOOKS\",\"mode\": \"MEASURE\",\"observer\": \"maxabs\",\"allowlist\": {\"types\": [], \"names\":  []},\"blocklist\": {\"types\": [], \"names\":  [\"lm_head\"]},\"quantize_weight\": false,\"dump_stats_path\": \"$1/$2/$3/inc_output\",\"calibration_sample_interval\": 1}"
     
     echo "$tmp_config" > $1/$2/maxabs_measure_$3.json
 }
@@ -149,18 +149,16 @@ fi
 MODEL_NAME=$(extract_last_folder_name "$MODEL_PATH")
 
 echo ""
-echo "Step 1/3 - detecting used device type [g2, g3]"
-DEVICE_TYPE=$(python3 ../step-0-detect-device.py) || (echo "Detecting device process failed" && exit 1)
+echo "Step 1/3 - detecting used device type ${ALLOWED_DEVICES[*]}"
+python3 step-0-detect-device.py > /dev/null  || DEVICE_TYPE=$?
 DEVICE_TYPE="g$DEVICE_TYPE"
-echo "Detected device type: $DEVICE_TYPE"
-echo "Step 1 done"
-
 # Check if the provided device type is valid
 if [[ ! " ${ALLOWED_DEVICES[*]} " =~ " $DEVICE_TYPE " ]]; then
     echo "Invalid device type: $DEVICE_TYPE. Allowed devices: ${ALLOWED_DEVICES[*]}"
     exit 1
 fi
-
+echo "Detected device type: $DEVICE_TYPE"
+echo "Step 1 done"
 
 create_measure_config $FP8_DIR $MODEL_NAME $DEVICE_TYPE
 create_quant_config $FP8_DIR $MODEL_NAME $DEVICE_TYPE

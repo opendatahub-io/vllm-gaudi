@@ -17,7 +17,6 @@ from vllm_gaudi.extension.defragmentation import OnlineDefragmenter
 from vllm_gaudi.extension.profiler import (HabanaMemoryProfiler, format_bytes, setup_profiler)
 from vllm_gaudi.extension.runtime import get_config
 
-import vllm.envs as envs
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.distributed import (ensure_model_parallel_initialized, init_distributed_environment)
 from vllm.distributed.kv_transfer import (
@@ -96,8 +95,10 @@ class HPUWorker(WorkerBase):
 
     def init_profiler(self):
         """Initialize the profiler."""
-        if envs.VLLM_TORCH_PROFILER_DIR:
-            torch_profiler_trace_dir = envs.VLLM_TORCH_PROFILER_DIR
+        torch_profiler_dir = os.getenv('VLLM_TORCH_PROFILER_DIR')
+        if torch_profiler_dir:
+            logger.warning("VLLM_TORCH_PROFILER_DIR is deprecated!")
+            torch_profiler_trace_dir = torch_profiler_dir
             logger.info("Profiling enabled. Traces will be saved to: %s", torch_profiler_trace_dir)
             if os.getenv('VLLM_PROFILER_ENABLED') == 'full':
                 fn = self.model_runner.profiler.full_trace_handler
@@ -201,10 +202,11 @@ class HPUWorker(WorkerBase):
 
                 hpu_k_scales = torch.ones(kv_scales_shape, dtype=torch.bfloat16,
                                           device='hpu') if create_dynamic_scales else None
-                if hpu_v_cache is None:
-                    hpu_v_scales = None
-                elif create_dynamic_scales:
-                    hpu_v_scales = torch.ones(kv_scales_shape, dtype=torch.bfloat16, device='hpu')
+                if create_dynamic_scales:
+                    hpu_v_scales = (torch.ones(kv_scales_shape, dtype=torch.bfloat16, device='hpu'),
+                                    torch.ones([num_blocks, num_kv_heads, head_size],
+                                               dtype=torch.bfloat16,
+                                               device='hpu'))
                 else:
                     hpu_v_scales = None
 
@@ -289,6 +291,13 @@ class HPUWorker(WorkerBase):
 
     def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
         """Allocate GPU KV cache with the specified kv_cache_config."""
+
+        # Init kv cache connector here, because it requires
+        # `kv_cache_config`.
+        # NOTE(Kuntai): This need to be done before `initialize_kv_cache`,
+        # because `initialize_kv_cache` will inject kv cache groups not
+        # related to kv cache connector (e.g. kv cache sharing layers).
+        ensure_kv_transfer_initialized(self.vllm_config, kv_cache_config)
 
         with HabanaMemoryProfiler() as m:
             self.kv_cache_config = kv_cache_config
@@ -479,8 +488,6 @@ def init_worker_distributed_environment(
     torch.distributed.all_reduce(dummy_tensor_hpu)
     assert dummy_tensor_hpu.item() == parallel_config.world_size * parallel_config.data_parallel_size
     ensure_model_parallel_initialized(parallel_config.tensor_parallel_size, parallel_config.pipeline_parallel_size)
-
-    ensure_kv_transfer_initialized(vllm_config)
 
 
 @contextmanager
